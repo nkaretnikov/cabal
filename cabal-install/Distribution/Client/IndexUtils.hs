@@ -57,13 +57,13 @@ import Distribution.Verbosity
 import Distribution.Simple.Utils
          ( die, warn, info, fromUTF8 )
 
-import Data.Char   (isAlphaNum)
-import Data.Maybe  (mapMaybe, fromMaybe)
+import Data.Char   (isAlphaNum, toLower)
+import Data.Maybe  (mapMaybe, fromMaybe, isJust, fromJust)
 import Data.List   (isPrefixOf)
 import Data.Monoid (Monoid(..))
 import qualified Data.Map as Map
-import Control.Monad (MonadPlus(mplus), when, liftM)
-import Control.Exception (evaluate)
+import Control.Monad (MonadPlus(mplus), when, unless, liftM, forM_, guard)
+import Control.Exception (evaluate, handleJust)
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BS.Char8
 import qualified Data.ByteString.Char8 as BSS
@@ -73,13 +73,17 @@ import Distribution.Client.Utils ( byteStringToFilePath
                                  , tryFindAddSourcePackageDesc )
 import Distribution.Compat.Exception (catchIO)
 import Distribution.Client.Compat.Time (getFileAge, getModTime)
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, createDirectoryIfMissing)
 import System.FilePath ((</>), takeExtension, splitDirectories, normalise)
 import System.FilePath.Posix as FilePath.Posix
-         ( takeFileName )
+         ( takeFileName, takeDirectory )
 import System.IO
 import System.IO.Unsafe (unsafeInterleaveIO)
 import System.IO.Error (isDoesNotExistError)
+import Distribution.Client.OpenPGP
+  ( decodePublicKey, maybePublicKeyInfo, pprintPublicKeyInfo, isUntrustedKey
+  , PublicKeyInfo(pkFingerprint) )
+import Data.List.Split (endBy)
 
 
 getInstalledPackages :: Verbosity -> Compiler
@@ -293,42 +297,52 @@ readPackageIndexFile :: Package pkg
                      -> FilePath
                      -> IO (PackageIndex pkg, [Dependency])
 readPackageIndexFile mkPkg indexFile = do
-  (mkPkgs, prefs) <- either fail return
-                     . parsePackageIndex
-                     . maybeDecompress
-                     =<< BS.readFile indexFile
+  -- XXX: use 'pkeys'.
+  (mkPkgs, prefs, pkeys) <- either fail return
+                          . parsePackageIndex
+                          . maybeDecompress
+                        =<< BS.readFile indexFile
 
   pkgEntries  <- sequence mkPkgs
   pkgs <- evaluate $ PackageIndex.fromList (map mkPkg pkgEntries)
   return (pkgs, prefs)
 
+data PublicKey = PublicKey { pkFileName :: String
+                           , pkContent  :: ByteString
+                           } deriving Show
+
 -- | Parse an uncompressed \"00-index.tar\" repository index file represented
 -- as a 'ByteString'.
 --
 parsePackageIndex :: ByteString
-                  -> Either String ([MkPackageEntry], [Dependency])
-parsePackageIndex = accum 0 [] [] . Tar.read
+                  -> Either String ([MkPackageEntry], [Dependency], [PublicKey])
+parsePackageIndex = accum 0 [] [] [] . Tar.read
   where
-    accum blockNo pkgs prefs es = case es of
+    accum blockNo pkgs prefs pkeys es = case es of
       Tar.Fail err   -> Left  err
-      Tar.Done       -> Right (reverse pkgs, reverse prefs)
-      Tar.Next e es' -> accum blockNo' pkgs' prefs' es'
+      Tar.Done       -> Right (reverse pkgs, reverse prefs, reverse pkeys)
+      Tar.Next e es' -> accum blockNo' pkgs' prefs' pkeys' es'
         where
-          (pkgs', prefs') = extract blockNo pkgs prefs e
-          blockNo'        = blockNo + Tar.entrySizeInBlocks e
+          (pkgs', prefs', pkeys') = extract blockNo pkgs prefs pkeys e
+          blockNo'                = blockNo + Tar.entrySizeInBlocks e
 
-    extract blockNo pkgs prefs entry =
-       fromMaybe (pkgs, prefs) $
-                 tryExtractPkg
-         `mplus` tryExtractPrefs
+    extract blockNo pkgs prefs pkeys entry =
+      fromMaybe (pkgs, prefs, pkeys) $
+                tryExtractPkg
+        `mplus` tryExtractPrefs
+        `mplus` tryExtractPKey
       where
         tryExtractPkg = do
           mkPkgEntry <- extractPkg entry blockNo
-          return (mkPkgEntry:pkgs, prefs)
+          return (mkPkgEntry:pkgs, prefs, pkeys)
 
         tryExtractPrefs = do
           prefs' <- extractPrefs entry
-          return (pkgs, prefs'++prefs)
+          return (pkgs, prefs'++prefs, pkeys)
+
+        tryExtractPKey = do
+          tks <- extractPKey entry
+          return (pkgs, prefs, tks:pkeys)
 
 extractPkg :: Tar.Entry -> BlockNo -> Maybe MkPackageEntry
 extractPkg entry blockNo = case Tar.entryContent entry of
@@ -376,19 +390,80 @@ parsePreferredVersions = mapMaybe simpleParse
                        . filter (not . isPrefixOf "--")
                        . lines
 
+extractPKey :: Tar.Entry -> Maybe PublicKey
+extractPKey entry = case Tar.entryContent entry of
+  Tar.NormalFile content _
+    | takeDirectory fileName == "public-keys"
+      -> Just $ PublicKey fileName content
+  _ -> Nothing
+  where
+    fileName = Tar.entryPath entry
+
 ------------------------------------------------------------------------
 -- Reading and updating the index cache
 --
 
 updatePackageIndexCacheFile :: FilePath -> FilePath -> IO ()
 updatePackageIndexCacheFile indexFile cacheFile = do
-    (mkPkgs, prefs) <- either fail return
-                       . parsePackageIndex
-                       . maybeDecompress
-                       =<< BS.readFile indexFile
+    (mkPkgs, prefs, pkeys) <- either fail return
+                            . parsePackageIndex
+                            . maybeDecompress
+                          =<< BS.readFile indexFile
     pkgEntries <- sequence mkPkgs
     let cache = mkCache pkgEntries prefs
     writeFile cacheFile (showIndexCache cache)
+    forM_ pkeys $ \pkey -> do
+      let indexKeyFile = takeFileName $ pkFileName pkey
+          indexKeysDir = takeDirectory $ pkFileName pkey
+          cacheDir     = takeDirectory cacheFile
+          cacheKeysDir = cacheDir </> indexKeysDir
+          cacheKeyFile = cacheKeysDir </> indexKeyFile
+          untrustedFingerprintsFile
+                       = cacheDir </> "untrusted-fingerprints"
+          content      = pkContent pkey
+          uname        = head $ endBy "-public.txt" indexKeyFile
+          mbNewPKey    = decodePublicKey $ BS.Char8.toStrict content
+      mbOldPKey
+        <- handleJust (guard . isDoesNotExistError) (const $ return Nothing) $
+             BSS.readFile cacheKeyFile >>= return . decodePublicKey
+      untrustedFingerprints
+        <- handleJust (guard . isDoesNotExistError) (const $ return []) $
+             BSS.readFile untrustedFingerprintsFile >>=
+               return . BSS.lines
+      when (isJust mbNewPKey) $ do
+        let newPKey       = fromJust mbNewPKey
+            handleNewPKey =
+              when (isJust $ maybePublicKeyInfo newPKey) $
+                let publicKeyInfo = fromJust $ maybePublicKeyInfo newPKey in
+                unless (isUntrustedKey publicKeyInfo untrustedFingerprints) $ do
+                  putStrLn $ "Do you trust the following key of " ++ uname
+                          ++ "? (yes/no/Skip)\n"
+                          ++ pprintPublicKeyInfo publicKeyInfo
+                  res <- getLine >>= return . map toLower
+                  case () of
+                    _ | any (== res) ["y", "yes"] -> do
+                        createDirectoryIfMissing False cacheKeysDir
+                        putStrLn "Marking the key as trusted."
+                        BS.Char8.writeFile cacheKeyFile content
+                      | any (== res) ["n", "no"] -> do
+                        putStrLn "Marking the key as untrusted."
+                        BSS.appendFile untrustedFingerprintsFile $
+                          BSS.append
+                            (BSS.pack . show $ pkFingerprint publicKeyInfo)
+                            (BSS.pack "\n")
+                      | otherwise -> putStrLn "Skipping the key."
+        if (isJust mbOldPKey)
+          then do
+            let oldPKey = fromJust mbOldPKey
+            when ((oldPKey /= newPKey) &&
+                  (isJust $ maybePublicKeyInfo oldPKey)) $ do
+              let publicKeyInfo = fromJust $ maybePublicKeyInfo oldPKey
+              putStrLn $ "Warning: the cache already contains "
+                      ++ "the following public key corresponding to "
+                      ++ uname ++ ":\n"
+                      ++ pprintPublicKeyInfo publicKeyInfo
+              handleNewPKey
+          else handleNewPKey
   where
     mkCache pkgs prefs =
         [ CachePreference pref          | pref <- prefs ]
